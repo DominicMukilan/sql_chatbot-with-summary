@@ -13,7 +13,7 @@ SQL_API_URL = os.getenv("SQL_API_URL", "https://bms.mapskil.com/api/v1/ai/execut
 SQL_API_KEY = os.getenv("SQL_API_KEY", "")
 
 # Schema settings
-SCHEMA_FILE_PATH = os.getenv("SCHEMA_FILE_PATH", "schema.sql")
+SCHEMA_FILE_PATH = os.getenv("SCHEMA_FILE_PATH", "schemas")
 
 # App settings
 APP_TITLE = "SQL Query Assistant"

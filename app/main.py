@@ -14,6 +14,8 @@ from services.sql_service import SQLService
 from services.query_executor_service import QueryExecutorService
 from utils.helpers import format_query_result, get_chat_history_context, sanitize_input
 from utils.logger import QueryLogger
+# Import our new SchemaManager
+from schema_manager import SchemaManager  # Make sure this file is in the correct location
 
 class SQLChatbotApp:
     """
@@ -22,6 +24,10 @@ class SQLChatbotApp:
     
     def __init__(self):
         """Initialize the application"""
+        # Set up the schema manager first
+        schemas_directory = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "schemas")
+        self.schema_manager = SchemaManager(schemas_directory)
+        
         self.setup_page()
         self.initialize_session_state()
         self.initialize_services()
@@ -40,26 +46,17 @@ class SQLChatbotApp:
     def initialize_services(self):
         """Initialize the services used by the application"""
         try:
-            # Initialize schema parser
-            self.schema_parser = SchemaParser(SCHEMA_FILE_PATH)
-            self.schema_description = ""
-            
-            # Check if schema is already loaded in session state
-            if st.session_state.schema_content:
-                # Write schema content to file
-                with open(SCHEMA_FILE_PATH, "w") as f:
-                    f.write(st.session_state.schema_content)
+            # Initialize schema parser with the active schema if available
+            if st.session_state.active_schema_id:
+                schema_filepath = self.schema_manager.get_schema_filepath(st.session_state.active_schema_id)
+                self.schema_parser = SchemaParser(schema_filepath)
+                self.schema_parser.parse()
+                self.schema_description = self.schema_parser.get_schema_description(include_samples=True)
+                st.session_state.schema_loaded = True
+            else:
+                self.schema_parser = SchemaParser(SCHEMA_FILE_PATH)
+                self.schema_description = ""
                 
-                # Parse schema from content in session state
-                self.schema_parser.parse()
-                self.schema_description = self.schema_parser.get_schema_description(include_samples=True)
-                st.session_state.schema_loaded = True
-            # Otherwise check if file exists
-            elif os.path.exists(SCHEMA_FILE_PATH):
-                self.schema_parser.parse()
-                self.schema_description = self.schema_parser.get_schema_description(include_samples=True)
-                st.session_state.schema_loaded = True
-            
             # Initialize LLM service with product summary if available
             self.llm_service = LLMService()
             if st.session_state.product_summary:
@@ -87,7 +84,7 @@ class SQLChatbotApp:
             st.session_state.chat_history = []
             
         if "schema_loaded" not in st.session_state:
-            st.session_state.schema_loaded = os.path.exists(SCHEMA_FILE_PATH)
+            st.session_state.schema_loaded = False
             
         if "last_query" not in st.session_state:
             st.session_state.last_query = ""
@@ -103,6 +100,10 @@ class SQLChatbotApp:
             
         if "product_summary" not in st.session_state:
             st.session_state.product_summary = None
+            
+        # New session state variables for schema management
+        if "active_schema_id" not in st.session_state:
+            st.session_state.active_schema_id = None
     
     def render_chat_history(self):
         """Render the chat history in the UI"""
@@ -155,11 +156,11 @@ class SQLChatbotApp:
             # Check if schema is loaded
             if not st.session_state.schema_loaded:
                 with st.chat_message("assistant"):
-                    st.markdown("Please upload a database schema file or paste schema content first.")
+                    st.markdown("Please select, upload, or paste a database schema first.")
                     
                 st.session_state.chat_history.append({
                     "role": "assistant",
-                    "content": "Please upload a database schema file or paste schema content first."
+                    "content": "Please select, upload, or paste a database schema first."
                 })
                 return
             
@@ -216,7 +217,7 @@ class SQLChatbotApp:
                             "max_retries": max_retries
                         })
 
-                        self.query_logger.log_query(user_query, sql_query,llm_response=result,result_summary= result_summary)
+                        self.query_logger.log_query(user_query, sql_query, llm_response=result, result_summary=result_summary)
                         
                     else:
                         # Query execution failed
@@ -253,7 +254,7 @@ class SQLChatbotApp:
                 "Timestamp": timestamp,
                 "User Query": log["user_query"],
                 "Query": log["sql_query"],
-                 "LLM Response": log.get("result_summary", "N/A"),
+                "LLM Response": log.get("result_summary", "N/A"),
             })
         
         log_df = pd.DataFrame(log_data)
@@ -282,6 +283,240 @@ class SQLChatbotApp:
                     formatted_data = format_query_result(selected_log["llm_response"])
                     if not formatted_data.empty:
                         st.dataframe(formatted_data, use_container_width=True)
+                        
+    def render_schema_selector(self, sidebar=False):
+        """Render the grid of saved schemas for selection
+        
+        Args:
+            sidebar (bool): Whether this is being rendered in the sidebar
+        """
+        st.subheader("Saved Schemas")
+        
+        # Get all saved schemas
+        schemas = self.schema_manager.get_all_schemas()
+        
+        if not schemas:
+            st.info("No saved schemas found. Upload a new schema to get started.")
+            return
+        
+        # If in sidebar, don't use columns (not supported in sidebar)
+        if sidebar:
+            for schema in schemas:
+                schema_name = schema.get("name", "Unnamed Schema")
+                schema_date = datetime.datetime.fromisoformat(schema.get("created_at", "")).strftime("%Y-%m-%d")
+                
+                # Create a container for each schema
+                with st.container():
+                    # If this is the active schema, highlight it
+                    if st.session_state.active_schema_id == schema["id"]:
+                        button_label = f"📌 {schema_name}"
+                    else:
+                        button_label = schema_name
+                    
+                    # Create a horizontal layout with the button and delete option
+                    st.markdown(f"<div style='display: flex; align-items: center;'>", unsafe_allow_html=True)
+                    
+                    # Selection button
+                    if st.button(button_label, key=f"schema_{schema['id']}"):
+                        # Load the selected schema
+                        schema_filepath = self.schema_manager.get_schema_filepath(schema["id"])
+                        schema_content = self.schema_manager.get_schema_content(schema["id"])
+                        
+                        # Update session state
+                        st.session_state.active_schema_id = schema["id"]
+                        st.session_state.schema_content = schema_content
+                        
+                        # Update schema parser
+                        self.schema_parser = SchemaParser(schema_filepath)
+                        self.schema_parser.parse()
+                        self.schema_description = self.schema_parser.get_schema_description(include_samples=True)
+                        
+                        st.session_state.schema_loaded = True
+                        
+                        # Update last used timestamp
+                        self.schema_manager.update_last_used(schema["id"])
+                        
+                        # Rerun to refresh the UI
+                        st.rerun()
+                    
+                    # Delete button (separate)
+                    delete_button = st.button("❌", key=f"delete_{schema['id']}", help=f"Delete schema: {schema_name}")
+                    
+                    st.markdown("</div>", unsafe_allow_html=True)
+                    
+                    # Handle delete action
+                    if delete_button:
+                        # Confirm deletion
+                        if st.session_state.get(f"confirm_delete_{schema['id']}", False):
+                            # Delete the schema
+                            success = self.schema_manager.delete_schema(schema["id"])
+                            
+                            if success:
+                                # If the deleted schema was the active one, reset active schema
+                                if st.session_state.active_schema_id == schema["id"]:
+                                    st.session_state.active_schema_id = None
+                                    st.session_state.schema_loaded = False
+                                
+                                # Clear confirmation state
+                                if f"confirm_delete_{schema['id']}" in st.session_state:
+                                    del st.session_state[f"confirm_delete_{schema['id']}"]
+                                
+                                # Rerun to refresh the UI
+                                st.rerun()
+                        else:
+                            # Set confirmation state
+                            st.session_state[f"confirm_delete_{schema['id']}"] = True
+                            # Force rerun to show confirmation
+                            st.rerun()
+                    
+                    # Show confirmation prompt if needed
+                    if st.session_state.get(f"confirm_delete_{schema['id']}", False):
+                        st.warning(f"Are you sure you want to delete '{schema_name}'?")
+                        
+                        if st.button("Yes, delete", key=f"confirm_{schema['id']}"):
+                            # Delete the schema
+                            success = self.schema_manager.delete_schema(schema["id"])
+                            
+                            if success:
+                                # If the deleted schema was the active one, reset active schema
+                                if st.session_state.active_schema_id == schema["id"]:
+                                    st.session_state.active_schema_id = None
+                                    st.session_state.schema_loaded = False
+                                
+                                # Clear confirmation state
+                                if f"confirm_delete_{schema['id']}" in st.session_state:
+                                    del st.session_state[f"confirm_delete_{schema['id']}"]
+                                
+                                # Rerun to refresh the UI
+                                st.rerun()
+                        
+                        if st.button("Cancel", key=f"cancel_{schema['id']}"):
+                            # Clear confirmation state
+                            if f"confirm_delete_{schema['id']}" in st.session_state:
+                                del st.session_state[f"confirm_delete_{schema['id']}"]
+                            
+                            # Rerun to refresh the UI
+                            st.rerun()
+                    
+                    # Show metadata
+                    st.caption(f"Created: {schema_date}")
+                    if schema.get("description"):
+                        st.caption(f"Description: {schema.get('description')[:50]}...")
+                    
+                    # Add a separator
+                    st.markdown("---")
+        else:
+            # Display schemas in a grid of buttons (3 columns) - for main area
+            cols = st.columns(3)
+            
+            for i, schema in enumerate(schemas):
+                col_idx = i % 3
+                
+                with cols[col_idx]:
+                    schema_name = schema.get("name", "Unnamed Schema")
+                    schema_date = datetime.datetime.fromisoformat(schema.get("created_at", "")).strftime("%Y-%m-%d")
+                    
+                    # Create a container for each schema button for styling
+                    with st.container():
+                        # Create a row for the schema button and delete button
+                        button_col, delete_col = st.columns([5, 1])
+                        
+                        with button_col:
+                            # If this is the active schema, highlight it
+                            if st.session_state.active_schema_id == schema["id"]:
+                                button_label = f"📌 {schema_name}"
+                            else:
+                                button_label = schema_name
+                            
+                            if st.button(button_label, key=f"schema_{schema['id']}"):
+                                # Load the selected schema
+                                schema_filepath = self.schema_manager.get_schema_filepath(schema["id"])
+                                schema_content = self.schema_manager.get_schema_content(schema["id"])
+                                
+                                # Update session state
+                                st.session_state.active_schema_id = schema["id"]
+                                st.session_state.schema_content = schema_content
+                                
+                                # Update schema parser
+                                self.schema_parser = SchemaParser(schema_filepath)
+                                self.schema_parser.parse()
+                                self.schema_description = self.schema_parser.get_schema_description(include_samples=True)
+                                
+                                st.session_state.schema_loaded = True
+                                
+                                # Update last used timestamp
+                                self.schema_manager.update_last_used(schema["id"])
+                                
+                                # Rerun to refresh the UI
+                                st.rerun()
+                        
+                        with delete_col:
+                            # Red X button for deletion
+                            if st.button("❌", key=f"delete_{schema['id']}", help=f"Delete schema: {schema_name}"):
+                                # Confirm deletion
+                                if st.session_state.get(f"confirm_delete_{schema['id']}", False):
+                                    # Delete the schema
+                                    success = self.schema_manager.delete_schema(schema["id"])
+                                    
+                                    if success:
+                                        # If the deleted schema was the active one, reset active schema
+                                        if st.session_state.active_schema_id == schema["id"]:
+                                            st.session_state.active_schema_id = None
+                                            st.session_state.schema_loaded = False
+                                        
+                                        # Clear confirmation state
+                                        if f"confirm_delete_{schema['id']}" in st.session_state:
+                                            del st.session_state[f"confirm_delete_{schema['id']}"]
+                                        
+                                        # Rerun to refresh the UI
+                                        st.rerun()
+                                else:
+                                    # Set confirmation state
+                                    st.session_state[f"confirm_delete_{schema['id']}"] = True
+                                    # Force rerun to show confirmation
+                                    st.rerun()
+                        
+                        # Show confirmation prompt if needed
+                        if st.session_state.get(f"confirm_delete_{schema['id']}", False):
+                            st.warning(f"Are you sure you want to delete '{schema_name}'?")
+                            
+                            confirm_col, cancel_col = st.columns(2)
+                            with confirm_col:
+                                if st.button("Yes, delete", key=f"confirm_{schema['id']}"):
+                                    # Delete the schema
+                                    success = self.schema_manager.delete_schema(schema["id"])
+                                    
+                                    if success:
+                                        # If the deleted schema was the active one, reset active schema
+                                        if st.session_state.active_schema_id == schema["id"]:
+                                            st.session_state.active_schema_id = None
+                                            st.session_state.schema_loaded = False
+                                        
+                                        # Clear confirmation state
+                                        if f"confirm_delete_{schema['id']}" in st.session_state:
+                                            del st.session_state[f"confirm_delete_{schema['id']}"]
+                                        
+                                        # Rerun to refresh the UI
+                                        st.rerun()
+                            
+                            with cancel_col:
+                                if st.button("Cancel", key=f"cancel_{schema['id']}"):
+                                    # Clear confirmation state
+                                    if f"confirm_delete_{schema['id']}" in st.session_state:
+                                        del st.session_state[f"confirm_delete_{schema['id']}"]
+                                    
+                                    # Rerun to refresh the UI
+                                    st.rerun()
+                        
+                        # Show metadata
+                        st.caption(f"Created: {schema_date}")
+                        if schema.get("description"):
+                            st.caption(f"Description: {schema.get('description')[:50]}...")
+    
+    def render_schema_management(self):
+        """Render the schema management section"""
+        # Display the schema selector grid (already includes delete functionality)
+        self.render_schema_selector()
     
     def render_sidebar(self):
         """Render the sidebar with configuration options and navigation"""
@@ -293,49 +528,90 @@ class SQLChatbotApp:
             
             # Schema Configuration Section
             st.subheader("Database Schema")
-            schema_tab1, schema_tab2 = st.tabs(["📁 Upload", "📝 Paste"])
+            
+            # Show current active schema if any
+            if st.session_state.active_schema_id:
+                schema_metadata = self.schema_manager.get_schema_metadata(st.session_state.active_schema_id)
+                if schema_metadata:
+                    st.success(f"Active Schema: {schema_metadata.get('name', 'Unnamed Schema')}")
+            
+            schema_tab1, schema_tab2, schema_tab3 = st.tabs(["📚 Select", "📁 Upload", "📝 Paste"])
             
             with schema_tab1:
+                # Render saved schemas for selection with sidebar mode
+                self.render_schema_selector(sidebar=True)
+            
+            with schema_tab2:
                 # Schema file upload
                 schema_file = st.file_uploader("Upload SQL Schema File", type=["sql"])
                 
                 if schema_file is not None:
-                    if st.button("Load Schema from File"):
-                        # Save uploaded file
+                    # Add fields for schema name and description
+                    schema_name = st.text_input("Schema Name", value=schema_file.name)
+                    schema_description = st.text_area("Schema Description (Optional)", 
+                                                    placeholder="Enter a description to help identify this schema later")
+                    
+                    if st.button("Save Schema"):
+                        # Read file content
                         schema_content = schema_file.getvalue().decode("utf-8")
-                        with open(SCHEMA_FILE_PATH, "wb") as f:
-                            f.write(schema_file.getbuffer())
                         
-                        # Store in session state
+                        # Save to schema manager
+                        schema_id = self.schema_manager.save_schema(
+                            schema_content=schema_content,
+                            schema_name=schema_name,
+                            original_filename=schema_file.name,
+                            description=schema_description
+                        )
+                        
+                        # Set as active schema
+                        st.session_state.active_schema_id = schema_id
                         st.session_state.schema_content = schema_content
                         
-                        # Reinitialize schema parser
-                        self.schema_parser = SchemaParser(SCHEMA_FILE_PATH)
+                        # Update schema parser
+                        schema_filepath = self.schema_manager.get_schema_filepath(schema_id)
+                        self.schema_parser = SchemaParser(schema_filepath)
                         self.schema_parser.parse()
                         self.schema_description = self.schema_parser.get_schema_description(include_samples=True)
                         
                         st.session_state.schema_loaded = True
-                        st.success("Schema file uploaded successfully!")
-            
-            with schema_tab2:
+                        st.success(f"Schema '{schema_name}' saved and activated!")
+                        
+                        # Rerun to refresh the UI
+                        st.rerun()
+
+            with schema_tab3:
                 # Schema pasting
                 pasted_schema = st.text_area("Paste SQL Schema Here", height=150)
                 
-                if pasted_schema.strip() and st.button("Load Pasted Schema"):
-                    # Save pasted schema to file
-                    with open(SCHEMA_FILE_PATH, "w") as f:
-                        f.write(pasted_schema)
+                if pasted_schema.strip():
+                    # Add fields for schema name and description
+                    schema_name = st.text_input("Schema Name", value="Pasted Schema")
+                    schema_description = st.text_area("Schema Description (Optional)", 
+                                                    placeholder="Enter a description to help identify this schema later")
                     
-                    # Store in session state
-                    st.session_state.schema_content = pasted_schema
-                    
-                    # Reinitialize schema parser
-                    self.schema_parser = SchemaParser(SCHEMA_FILE_PATH)
-                    self.schema_parser.parse()
-                    self.schema_description = self.schema_parser.get_schema_description(include_samples=True)
-                    
-                    st.session_state.schema_loaded = True
-                    st.success("Schema loaded successfully from text input!")
+                    if st.button("Save Pasted Schema"):
+                        # Save to schema manager
+                        schema_id = self.schema_manager.save_schema(
+                            schema_content=pasted_schema,
+                            schema_name=schema_name,
+                            description=schema_description
+                        )
+                        
+                        # Set as active schema
+                        st.session_state.active_schema_id = schema_id
+                        st.session_state.schema_content = pasted_schema
+                        
+                        # Update schema parser
+                        schema_filepath = self.schema_manager.get_schema_filepath(schema_id)
+                        self.schema_parser = SchemaParser(schema_filepath)
+                        self.schema_parser.parse()
+                        self.schema_description = self.schema_parser.get_schema_description(include_samples=True)
+                        
+                        st.session_state.schema_loaded = True
+                        st.success(f"Schema '{schema_name}' saved and activated!")
+                        
+                        # Rerun to refresh the UI
+                        st.rerun()
             
             # Product Summary Section
             with st.expander("📋 Product Context", expanded=False):
@@ -356,45 +632,6 @@ class SQLChatbotApp:
                     st.success("Product summary saved successfully!")
             
             return page
-    
-    def _create_focused_schema(self, relevant_tables):
-        """
-        Create a focused schema description with only the relevant tables
-        
-        Args:
-            relevant_tables (set): Set of relevant table names
-            
-        Returns:
-            str: Focused schema description
-        """
-        schema_parts = ["Database Schema (Focused):\n"]
-        
-        # Add tables
-        for table_name in relevant_tables:
-            if table_name in self.schema_parser.tables:
-                table_info = self.schema_parser.tables[table_name]
-                
-                # Add table name
-                schema_parts.append(f"Table: {table_name}\nColumns:")
-                
-                # Add columns
-                for col_name, col_info in table_info["columns"].items():
-                    pk = " (Primary Key)" if col_info.get("primary_key") else ""
-                    nn = " NOT NULL" if col_info.get("not_null") else ""
-                    default = f" DEFAULT {col_info['default']}" if col_info.get("default") else ""
-                    schema_parts.append(f"  - {col_name}: {col_info['type']}{nn}{default}{pk}")
-                
-                schema_parts.append("")
-        
-        # Add relationships between relevant tables
-        schema_parts.append("Relationships:")
-        for rel in self.schema_parser.relationships:
-            if rel["source_table"] in relevant_tables and rel["target_table"] in relevant_tables:
-                schema_parts.append(
-                    f"  - {rel['source_table']}.{rel['source_column']} -> {rel['target_table']}.{rel['target_column']}"
-                )
-        
-        return "\n".join(schema_parts)
     
     def run(self):
         """Run the Streamlit application"""
